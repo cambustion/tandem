@@ -286,14 +286,90 @@ class CPMA(CambustionClass):
     # which of those fields we actually want to record in our file
     valueFields = ["Speed (rad/s)", "Voltage (V)",
                    "Pressure (Pa)", "Temperature (C)"]
-    quantity = "Mp (fg)"
+    quantity = "m* (fg)"
     label = "m*"
+
+    def __init__(self, isSerial, ip, serPort, start, end, perdec, flow, RorQsh):
+        super().__init__(isSerial, ip, serPort, start, end, perdec, flow, RorQsh)
+        self.calK = 0.0  # Default fallback if version is < 2.410 or query fails
+
 
     def connect(self):
         if (not super().connect()):
             return False
-        return (self.match(self.getRsp(), "Cambustion CPMA"))
+        
+        rsp = self.getRsp()
+        if not self.match(rsp, "Cambustion CPMA"):
+            return False
 
+        # Check Version and Retrieve K-Factor
+        self.update_k_factor()
+        return True
+
+    def parse_version(self, ver_str):
+        """Extracts numerical version (e.g., '2.410') from CPMA response string."""
+        import re
+        match = re.search(r'(\d+\.\d+)', ver_str)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    def update_k_factor(self):
+        """Checks if CPMA UI >= 2.410 and fetches active K-factor."""
+        ver_rsp = self.sendQuery("Version")
+        ver_num = self.parse_version(ver_rsp)
+
+        if ver_num >= 2.410:
+            which_cal = self.sendQuery("GetWhichCal").strip().lower()
+            if "user" in which_cal:
+                k_rsp = self.sendQuery("GetUserCal")
+            else:
+                k_rsp = self.sendQuery("GetFactoryCal")
+            
+            try:
+                self.calK = float(k_rsp.strip())
+            except ValueError:
+                self.calK = 0.0
+        else:
+            self.calK = 0.0
+    
+    def GetRealMass(self, V, omega):
+        """
+        Calculates actual mass in fg using the K-factor adjusted CPMA geometry.
+        Formula matches CPMA UI v2.410+ specification.
+        """
+        if omega == 0.0:
+            return 0.0
+
+        e = 1.6e-19
+        r_inner_nominal = 60.0e-3
+        r_outer_nominal = 61.0e-3
+
+        gap_nominal = r_outer_nominal - r_inner_nominal
+        rInner = r_inner_nominal + (self.calK * gap_nominal) / 2.0
+        rOuter = r_outer_nominal - (self.calK * gap_nominal) / 2.0
+        rAve = (rOuter + rInner) / 2.0
+
+        # Output in fg (1.0E18 conversion multiplier)
+        mass_fg = (1.0e18 * e * V) / (omega * omega * rAve * rAve * np.log(rOuter / rInner))
+        return mass_fg
+
+    def getFileData(self):
+        # Get the standard dictionary of averaged values from the parent class
+        data = super().getFileData()
+        
+        # Extract the dynamically averaged speed and voltage for this specific setpoint
+        omega = data["Speed (rad/s)"]
+        V = data["Voltage (V)"]
+        
+        # Calculate and append the actual mass to the data dictionary
+        data[self.quantity] = self.GetRealMass(V, omega)
+        
+        return data
+    
     def set(self, x):
         return self.sendFloat("SetMass", x)
 
@@ -309,8 +385,10 @@ class CPMA(CambustionClass):
         header['Start (fg)'] = self.start
         header['End (fg)'] = self.end
         header['Per decade'] = self.perdec
+        header['Calibration K Factor'] = self.calK
         self.headerFields = list(header.keys())
         return header
+    
 
 
 class AAC(CambustionClass):
@@ -318,15 +396,25 @@ class AAC(CambustionClass):
                      "serial detector", "AI1 V", "AI2 V", "AI3 V", "AO1 V", "AO2 V", "AO3 V", "run status", "motor temperature", "main CPC", "PSU voltage", "Pressure (Pa)", "classifier speed feedback"]
     valueFields = ["Speed (rad/s)", "Sheath flow (lpm)",
                    "Pressure (Pa)", "Temperature (C)"]
-    quantity = "Da (nm)"
+    quantity = "da* (nm)"
     label = "da*"
     isScanning = False
     mtc = False
 
     def __init__(self, isSerial, ip, serPort, start, end, perdec, flow, RorQsh, ScanUpTime, resAve, delayTime, PreFactor, Exponent, f_lower, f_upper, IsWater, IsSoot, IsNone, variableBins, isScanner):
+        # Create an instance-specific copy of the fields so we don't alter the global class
+        self.valueFields = list(self.valueFields)
+        
         super().__init__(isSerial, ip, serPort, start, end, perdec, flow, RorQsh)
         self.isScanner = isScanner
-        if (isScanner):
+        
+        if (self.isScanner):
+            # Dynamically remove the Speed column from the file output arrays
+            if "Speed (rad/s)" in self.valueFields:
+                self.valueFields.remove("Speed (rad/s)")
+            if "Speed (rad/s)" in self.fileFields:
+                self.fileFields.remove("Speed (rad/s)")
+                
             self.resAve = resAve
             self.delayTime = delayTime
             self.ScanUpTime = ScanUpTime
@@ -500,7 +588,7 @@ class AAC(CambustionClass):
 
 class TSIDma(Classifier):
     querydelay = 0.1
-    quantity = "Dm (nm)"
+    quantity = "dm* (nm)"
     label = "dm*"
 
     def __init__(self, isSerial, ip, serPort, start, end, perdec, flow, RorQsh):
@@ -552,6 +640,7 @@ class TSI3080(TSIDma):
 
 class TSI3082(TSIDma):
     ipPort = 3602
+    querydelay = 0.1
 
     def __init__(self, isSerial, ip, serPort, start, end, perdec, flow, RorQsh, HighFlow, Polarity, ScanUpTime, LowerRange, UpperRange, PreFactor, Exponent, f_lower, f_upper, IsWater, IsSoot, IsNone, variableBins, isScanner):
         super().__init__(isSerial, ip, serPort, start, end, perdec, flow, RorQsh)
@@ -570,11 +659,11 @@ class TSI3082(TSIDma):
         if f_lower and f_lower.strip():  # Check if not None and not an empty string
             self.f_lower = float(f_lower)
         else:
-            self.f_lower = 0.85
+            self.f_lower = 0.75
         if f_upper and f_upper.strip():  # Check if not None and not an empty string
             self.f_upper = float(f_upper)
         else:
-            self.f_upper = 1.1
+            self.f_upper = 1.25
 
         if self.IsWater:
             self.PreFactor = 523.6
@@ -651,29 +740,32 @@ class TSI3082(TSIDma):
         return self.sendFloat("WSSCANUPTIME ", ScanUpTime)
 
     def setLowerRange(self, LowerRange):
-        return self.sendFloat("WSLOWERSIZE ", LowerRange)
+        return self.sendAndCheck(f"WSLOWERSIZE {int(LowerRange)}")
 
     def setUpperRange(self, UpperRange):
-        return self.sendFloat("WSUPPERSIZE ", UpperRange)
+        return self.sendAndCheck(f"WSUPPERSIZE {int(UpperRange)}")
 
     def VarDiameter(self, mStar):  # m = K * dm ^ Dm based on Olfert and Rogak, 2019
         K = self.PreFactor
         Dm = self.Exponent
-        dmStar = pow((mStar * (10 ** -18)) / K, 1 / Dm) * (10 ** 9)
-        Lower = pow(dmStar, self.f_lower)
-        Upper = pow(dmStar, self.f_upper)
-        TSIsetPoints = [1.02, 1.06, 1.09, 1.13, 1.18, 1.22, 1.26, 1.31, 1.36, 1.41, 1.46, 1.51, 1.57, 1.63, 1.68, 1.75, 1.81, 1.88, 1.95, 2.02, 2.09, 2.17, 2.25, 2.33, 2.41, 2.5, 2.59, 2.69, 2.79, 2.89, 3, 3.11, 3.22, 3.34, 3.46, 3.59, 3.72,
-                        3.85, 4, 4.14, 4.29, 4.45, 4.61, 4.78, 4.96, 5.14, 5.33, 5.52, 5.73, 5.94, 6.15, 6.38, 6.61, 6.85, 7.1, 7.37, 7.64, 7.91, 8.2, 8.51, 8.82, 9.14, 9.47, 9.82, 10.2, 10.6, 10.9, 11.3, 11.8, 12.2, 12.6, 13.1, 13.6, 14.1,
-                        14.6, 15.1, 15.7, 16.3, 16.8, 17.5, 18.1, 18.8, 19.5, 20.2, 20.9, 21.7, 22.5, 23.3, 24.1, 25, 25.9, 26.9, 27.9, 28.9, 30, 31.1, 32.2, 33.4, 34.6, 35.9, 37.2, 38.5, 40, 41.4, 42.9, 44.5, 46.1, 47.8, 49.6, 51.4, 53.3, 55.2,
-                        57.3, 59.4, 61.5, 63.8, 66.1, 68.5, 71, 73.7, 76.4, 79.1, 82, 85.1, 88.2, 91.4, 94.7, 98.2, 102, 106, 109, 113, 118, 122, 126, 131, 136, 141, 146, 151, 157, 163, 168, 175, 181, 188, 195, 202, 209, 217, 225, 233, 241,
-                        250, 259, 269, 279, 289, 300, 311, 322, 334, 346, 359, 372, 385, 400, 414, 429, 445, 461, 478, 496, 514, 533, 552, 573, 594, 615, 638, 661, 685, 710, 737, 764, 791, 820, 851, 882, 914, 947, 982]
-        LowerIndices = [i for i, value in enumerate(
-            TSIsetPoints) if value <= Lower]
-        LowerIndices = max(LowerIndices)
-        UpperIndices = [i for i, value in enumerate(
-            TSIsetPoints) if value < Upper]
-        UpperIndices = max(UpperIndices) + 1
-        return self.sendFloat("WSLOWERSIZE ", LowerIndices) and self.sendFloat("WSUPPERSIZE ", UpperIndices)
+        dmStar = pow((mStar * 1e-18) / K, 1 / Dm) * 1e9
+
+        Lower = dmStar * self.f_lower
+        Upper = dmStar * self.f_upper
+        
+        bin_edges = np.logspace(np.log10(1), np.log10(1000), num=193)
+        bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+        TSIsetPoints = np.round(bin_centers, 2).tolist()
+
+        LowerIndices = [i for i, value in enumerate(TSIsetPoints) if value <= Lower]
+        LowerIndex = max(LowerIndices) if LowerIndices else 0
+
+        UpperIndices = [i for i, value in enumerate(TSIsetPoints) if value < Upper]
+        
+        # Clamp maximum index to 191 (192 channels total)
+        UpperIndex = min(191, max(UpperIndices) + 1) if UpperIndices else 191
+
+        return self.setLowerRange(LowerIndex) and self.setUpperRange(UpperIndex)
 
     def LowerSizeRange(self):
         return self.sendQuery("RSLOWERSIZE")
@@ -685,24 +777,51 @@ class TSI3082(TSIDma):
         return self.sendQuery("RMERRORS")
 
     def output3082(self):
-        Conc3082 = self.sendQuery("RDSMPSDATA4").split('\r\n')
-        return Conc3082
+        self.sendCmd("RDSMPSDATA4")
+        time.sleep(0.3)  # Give the 3082 time to format the payload
+        
+        full_rsp = ""
+        start_time = time.time()
+        
+        # Keep reading until 193+ lines arrive or timeout occurs (3 seconds)
+        while time.time() - start_time < 3.0:
+            if self.isSerial:
+                chunk = self.ser.readline().decode(errors='ignore')
+            else:
+                try:
+                    chunk = self.sock.recv(8192).decode(errors='ignore')
+                except:
+                    break
+            
+            full_rsp += chunk
+            lines = full_rsp.strip().split('\r\n')
+            if len(lines) >= 193:
+                break
+                
+        return full_rsp.strip().split('\r\n')
 
     def StartScan(self):
-        #          return True # uncomment to use "hardwareless" CPMA/AAC screen
+        self.StopScan()  # Issues DOABORTSCAN to unlock settings buffer
+        time.sleep(0.2)  # Grace period for firmware state change
+        self.sendQuery("RMERRORS")
+        self.Dataready3082 = 0
         return self.sendAndCheck("DOSCAN")
 
     def StopScan(self):
         return self.sendAndCheck("DOABORTSCAN")
 
     def DataReady(self):  # Gets the DMA status and check if it is at the end of scanning
-        self.ScanStatus = self.sendQuery("RDSMPSDATA1").split('\r\n')
-        Dataready = self.ScanStatus[8]
-        self.Dataready3082 = int(Dataready[11])
-        if (self.Dataready3082 == 1):
-            return True
-        else:
-            return False
+        try:
+            rsp = self.sendQuery("RDSMPSDATA1")
+            self.ScanStatus = rsp.split('\r\n')
+            
+            if len(self.ScanStatus) > 8 and len(self.ScanStatus[8]) > 11:
+                self.Dataready3082 = int(self.ScanStatus[8][11])
+                return self.Dataready3082 == 1
+        except (IndexError, ValueError, AttributeError):
+            self.Dataready3082 = 0
+            
+        return False
 
     tolerance = 0.05
     # 3082 doesn't have a "return everything" command, so need to send a series of commands, which are in this dictionary of field:command

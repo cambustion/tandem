@@ -7,9 +7,12 @@
 from PyQt5 import QtWidgets, uic
 from PyQt5.QtCore import QTimer, Qt, QSettings
 from PyQt5.uic import loadUi
+from PyQt5.QtWidgets import QShortcut
+from PyQt5.QtGui import QKeySequence
 import sys
 import instruments
 import mplwidget
+import aerosol_psd_fitting_tool
 import numpy as np
 import time
 import datetime
@@ -17,6 +20,7 @@ import csv
 import platform
 import ctypes
 import os
+import re
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 import matplotlib.colors as mcolors
@@ -24,13 +28,13 @@ import matplotlib as mpl
 
 
 version = "0.2"
-
 app = QtWidgets.QApplication(sys.argv)
 
 
 class Ui(QtWidgets.QMainWindow):  # main GUI object
     def __init__(self):
         super(Ui, self).__init__()
+
         uic.loadUi('tandem.ui', self)
         if (platform.system() == 'Windows'):  # makes taskbar icon work in Windows 7 onwards
             appid = 'Cambustion.Tandem.'+version
@@ -40,25 +44,56 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
         self.setWindowFlags(self.windowFlags() |
                             Qt.MSWindowsFixedSizeDialogHint)
         self.settings = QSettings("Cambustion", "Tandem")
+        self.isScanning = False
         self.getSettings()
+
+        # Grab references to the axes
         self.graph = self.plotWidget.canvas.ax
         self.plot = self.MplWidget.canvas.ax
         self.plot_live = self.MplWidget_live.canvas.ax
-        self.plot_live.set_xscale('log')
-        self.plot_live.set_xlabel('Second Classifier setpoints')
-        self.plot_live.set_ylabel('Particle Concentration [Counts]')
-        self.plot.set_xscale('log')
-        self.plot.set_xlabel('Second Classifier setpoints')
-        self.plot.set_ylabel('Particle Concentration [Counts]')
+        
+        # Create the twin axis once during initialization
         self.plot2 = self.plot.twinx()
+
+        # Use the new utility method to set up default states
+        self.MplWidget_live.setup_axes(
+            xlabel='Second Classifier setpoints', 
+            ylabel='Particle Concentration [Counts]', 
+            xscale='log'
+        )
+        
+        self.MplWidget.setup_axes(
+            xlabel='Second Classifier setpoints', 
+            ylabel='Particle Concentration [Counts]', 
+            xscale='log'
+        )
         self.plot2.set_ylabel('Bypass Particle Concentration [Counts]')
-        self.graph.set_yscale('log')
-        self.graph.set_xscale('log')
-        self.graph.set_xlabel('First Classifier')
-        self.graph.set_ylabel('Second Classifier')
-        self.fig = self.graph.get_figure()  # Get the Figure object
-        self.isScanning = False
+        
+        self.plotWidget.setup_axes(
+            xlabel='First Classifier', 
+            ylabel='Second Classifier', 
+            xscale='log', 
+            yscale='log'
+        )
+
+        self.fig = self.graph.get_figure()
+        # --- Keyboard Shortcuts ---
+        self.shortcut_start = QShortcut(QKeySequence('F5'), self)
+        self.shortcut_start.activated.connect(self.startButton.click)
+
+        self.shortcut_stop = QShortcut(QKeySequence('Esc'), self)
+        self.shortcut_stop.activated.connect(self.safeStop)
+
+        # Stop Button for Safety Guard 
+        try:
+            # Disconnect the default Qt Designer UI connection
+            self.stopButton.clicked.disconnect()
+        except TypeError:
+            pass
+        # Connect to the new safe stop method
+        self.stopButton.clicked.connect(self.safeStop)
         self.show()
+        
 
     def getSettings(self):
         self.actionSave_Settings_on_Exit.setChecked(
@@ -214,43 +249,56 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
             pass
         event.accept()  # let the window close
 
+    def safeStop(self):
+        """Prompts the user before stopping an active scan."""
+        if self.isScanning:
+            reply = QtWidgets.QMessageBox.question(
+                self, 
+                'Confirm Stop', 
+                'A scan is currently in progress. Are you sure you want to stop it?',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, 
+                QtWidgets.QMessageBox.No
+            )
+            if reply == QtWidgets.QMessageBox.Yes:
+                self.endScan()
+        else:
+            self.endScan()
+
+
     def runScan(self):
-        if (os.path.isfile(self.fileName)):
-            if (QtWidgets.QMessageBox.question(self, "Tandem", "Raw data file exists. Overwrite?", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.No):
-                return
+        # Extract directory, base name, and extension from the currently active file path
+        file_dir, file_name = os.path.split(self.fileName)
+        base, ext = os.path.splitext(file_name)
+        
+        # Clean the base name by removing any existing YYYYMMDD_ prefix and _XX suffix
+        base = re.sub(r'^\d{8}_', '', base)
+        base = re.sub(r'_\d+$', '', base)
+        
+        # Get the current date in YYYYMMDD format
+        date_str = time.strftime("%Y%m%d")
+        
+        # Start counter at 1 and construct the new name with a zero-padded suffix (e.g., 01, 02)
+        counter = 1
+        new_fileName = os.path.join(file_dir, f"{date_str}_{base}_{counter:02d}{ext}")
+        
+        # Auto-increment the suffix if the file already exists in the directory
+        while os.path.isfile(new_fileName):
+            counter += 1
+            new_fileName = os.path.join(file_dir, f"{date_str}_{base}_{counter:02d}{ext}")
+            
+        self.fileName = new_fileName
+        
+        if hasattr(self, 'rawFileDisplay'):
+            self.rawFileDisplay.setText("Raw Data File: " + self.fileName)
         self.header_3082 = True
         self.makesecondClassX = True
         self.Scatterplot = False
-        # Clear the existing plots
-        self.plot.clear()
-        self.plot2.clear()
-        if self.plot is not None and self.plot.get_legend() is not None:
-            self.plot.get_legend().remove()
-        # Adjust the layout to accommodate the legend outside the box
-        self.plotWidget.canvas.figure.tight_layout(
-            rect=[0, 0, 1, 1])  # Adjust the right margin
-        self.MplWidget.canvas.figure.tight_layout(
-            rect=[0.03, 0.03, 0.87, 1])   # Adjust the right margin
-        self.graph.clear()
-        self.graph = self.plotWidget.canvas.ax
-        self.plot = self.MplWidget.canvas.ax
-        self.plot_live = self.MplWidget_live.canvas.ax
-        self.plot_live.set_xscale('log')
-        self.plot_live.set_xlabel('Second Classifier setpoints')
-        self.plot_live.set_ylabel('Particle Concentration [Counts]')
-        self.plot.set_xscale('log')
-        self.plot.set_xlabel('Second Classifier setpoints')
-        self.plot.set_ylabel('Particle Concentration [Counts]')
-        self.plot2.set_ylabel('Bypass Particle Concentration [Counts]')
-        self.graph.set_yscale('log')
-        self.graph.set_xscale('log')
-        self.graph.set_xlabel('First Classifier')
-        self.graph.set_ylabel('Second Classifier')
-        self.fig = self.graph.get_figure()  # Get the Figure object
+
         self.stopButton.setEnabled(True)
         self.startButton.setEnabled(False)
         self.statusbar.showMessage("Initialising first classifier...")
         app.processEvents()
+
         c = self.firstClassifierList.currentItem().text()
         if (c == "AAC"):
             self.firstClass = instruments.AAC
@@ -261,10 +309,12 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
         elif (c == "3082 DMA"):
             self.firstClass = instruments.TSI3082
         if (c == "3082 DMA"):
-            self.firstClass = self.firstClass(self.firstIsSerial.isChecked(), self.firstIP.toPlainText(), self.firstPort.toPlainText(), float(self.firstFrom.toPlainText()), float(self.firstTo.toPlainText()),  int(
+            ClassifierType = instruments.TSI3082
+            self.firstClass = ClassifierType(self.firstIsSerial.isChecked(), self.firstIP.toPlainText(), self.firstPort.toPlainText(), float(self.firstFrom.toPlainText()), float(self.firstTo.toPlainText()),  int(
                 self.firstPerDecade.toPlainText()), float(self.firstQa.toPlainText()), float(self.firstRorQsh.toPlainText()),  False, self.firstPolarity.isChecked(), 0, 0, 0, 0, 0, 0, 0, False, False, False, False, False)
         elif (c == "AAC"):
-            self.firstClass = self.firstClass(self.firstIsSerial.isChecked(), self.firstIP.toPlainText(), self.firstPort.toPlainText(), float(self.firstFrom.toPlainText()), float(
+            ClassifierType = instruments.AAC
+            self.firstClass = ClassifierType(self.firstIsSerial.isChecked(), self.firstIP.toPlainText(), self.firstPort.toPlainText(), float(self.firstFrom.toPlainText()), float(
                 self.firstTo.toPlainText()), int(self.firstPerDecade.toPlainText()), float(self.firstQa.toPlainText()), float(self.firstRorQsh.toPlainText()), 0, 0, 0, 0, 0, 0, 0, False, False, False, False, False)
         else:
             self.firstClass = self.firstClass(self.firstIsSerial.isChecked(), self.firstIP.toPlainText(), self.firstPort.toPlainText(), float(self.firstFrom.toPlainText(
@@ -359,40 +409,109 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
             del self.cpc
             return
 
-        self.graph.set_xlabel(
-            f"{self.firstClass.label}[{self.firstFromUnit.text()}]")
-        self.graph.set_ylabel(
-            f"{self.secondClass.label}[{self.secondFromUnit.text()}]")
-        self.plot.set_xlabel(
-            f"{self.secondClass.label}[{self.secondFromUnit.text()}]")
+        
+        first_label = self.firstClass.label.replace("dm*", "$d_m^*$").replace("da*", "$d_a^*$").replace("m*", "$m^*$")
+        second_label = self.secondClass.label.replace("dm*", "$d_m^*$").replace("da*", "$d_a^*$").replace("m*", "$m^*$")
+        
+        # Temporarily set to linear to avoid Matplotlib warnings when clearing
+        self.plot.set_xscale('linear')
+        self.plot_live.set_xscale('linear')
+        
+        # Wipe old plots
+        self.plot.clear()
+        self.plot2.clear()
+        self.plot_live.clear()
+        self.graph.clear()
+
+        self.MplWidget.setup_axes(
+            xlabel=f"{second_label} [{self.secondFromUnit.text()}]", 
+            ylabel='Particle Concentration [Counts]', 
+            xscale='log'
+        )
+        
+        self.plot2.set_ylabel('Bypass Particle Concentration [Counts]')
+        self.plot2.yaxis.tick_right()
+        self.plot2.yaxis.set_label_position("right")
+        
+        self.MplWidget_live.setup_axes(
+            xlabel=f"{second_label} [{self.secondFromUnit.text()}]", 
+            ylabel='Particle Concentration [Counts]', 
+            xscale='log'
+        )
+        
+        self.plotWidget.setup_axes(
+            xlabel=f"{first_label} [{self.firstFromUnit.text()}]", 
+            ylabel=f"{second_label} [{self.secondFromUnit.text()}]", 
+            xscale='log', 
+            yscale='log'
+        )
+
+        # Set non-scientific notation for major ticks, and hide minor tick labels
+        self.graph.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+        self.graph.axes.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+        self.graph.axes.yaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+        self.graph.axes.yaxis.set_minor_formatter(mpl.ticker.NullFormatter())
 
         if not (self.isScanner):
             self.plot.set_ylabel("Particle Concentration")
-            self.X, self.Y = np.meshgrid(
-                self.firstClass.X, self.secondClass.X, indexing='ij')
-            self.Z = np.zeros(
-                (self.firstClass.points, self.secondClass.points))
+            self.X, self.Y = np.meshgrid(self.firstClass.X, self.secondClass.X, indexing='ij')
+            self.Z = np.zeros((self.firstClass.points, self.secondClass.points))
             self.G = np.zeros(self.secondClass.points)
+            
         elif (self.secondClassifierList.currentItem().text() == "AAC"):
             self.plot.set_ylabel("N [Counts]")
             self.X, self.Y = np.meshgrid(
                 self.firstClass.X, self.secondClass.X, indexing='ij')
             self.Z = np.zeros((1, self.secondClass.points))
             self.G = np.zeros(1)
+            
+        elif (self.secondClassifierList.currentItem().text() == "3082 DMA" and self.isScanner):
+            self.plot.set_ylabel("N [Counts]")
+            # Initialize the 2D arrays for the 3082 SMPS scan!
+            num_channels = self.secondLowerRange.count()  # 192 channels
+            self.secondClassX = np.array([float(self.secondLowerRange.itemText(i)) for i in range(num_channels)])
+            
+            self.X, self.Y = np.meshgrid(self.firstClass.X, self.secondClassX, indexing='ij')
+            self.Z = np.zeros((self.firstClass.points, num_channels))
+            self.G = np.zeros(num_channels)
+            
         else:
             self.plot.set_ylabel("N [Counts]")
+            self.X, self.Y = np.meshgrid(self.firstClass.X, self.secondClass.X, indexing='ij')
+            self.Z = np.zeros((self.firstClass.points, self.secondClass.points))
+            self.G = np.zeros(self.secondClass.points)
 
         # Create a colormap with a gradient from light to dark color
-        light_color = np.array([0.0, 1.0, 0.0])
-        dark_color = np.array([0.0, 0.0, 0.1])
-        # Define the number of intermediate colors
-        num_intermediate_colors = self.firstClass.points
-        # Create a list of colors by linear interpolation
-        colors = [light_color + (dark_color - light_color) * i /
-                  num_intermediate_colors for i in range(num_intermediate_colors + 1)]
-        # Create a LinearSegmentedColormap
-        self.cmap = mcolors.LinearSegmentedColormap.from_list(
-            "custom_cmap", colors)
+        self.cmap = plt.get_cmap('viridis')
+
+        # Initialize the 2D mesh using pcolormesh (faster than pcolor)
+        self.mesh_2d = self.graph.axes.pcolormesh(
+            self.X, self.Y, self.Z, 
+            shading='nearest', 
+            cmap=self.cmap,
+            # SymLogNorm handles 0 values safely while scaling the colors logarithmically
+            norm=mcolors.SymLogNorm(linthresh=1.0, linscale=1.0, vmin=0, vmax=max(self.Z.max(), 10.0))
+        )      
+
+        self.graph.axes.set_xlim(left=self.X.min(), right=self.X.max())
+        self.graph.axes.set_ylim(bottom=self.Y.min(), top=self.Y.max())
+
+        # Initialize the live 1D line graph
+        self.plot_live.set_xscale('log')
+        self.plot_live.set_xlabel(f"{second_label} [{self.secondFromUnit.text()}]")
+        self.plot_live.set_ylabel("N [Counts]")
+        
+        # Set non-scientific notation for major ticks and hide minor labels
+        self.plot_live.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+        self.plot_live.axes.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+        
+        # Save the line object
+        self.live_line, = self.plot_live.axes.plot([], [], label="Live Data")
+        self.plot_live.axes.legend(loc='upper left', fontsize='small')
+        
+        self.plotWidget.canvas.figure.tight_layout()
+        self.MplWidget_live.canvas.figure.tight_layout()
+
         self.isScanning = True
         self.statusbar.showMessage("Scanning")
         self.timer = QTimer()
@@ -410,6 +529,7 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
             self.barf("Failed to set second classifier. Reason: " +
                       self.secondClass.lastResponse)
             return
+
         if (self.doBypass):
             # self.firstClass.enableBypass(1)  # When using the analog output of the instrument
             self.arduino.enableBypass()  # When using the Arduino
@@ -482,27 +602,43 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                         return
                 # run the scanning 2nd classifier after first classifier is ready
                 if (self.isScanner):
-                    if (not self.doBypass):
-                        if (self.varBins):
-                            self.secondClass.VarDiameter(
-                                self.firstClass.X[self.firstClass.point])
+                    if (not self.doBypass and self.varBins):
+                        self.secondClass.VarDiameter(
+                            self.firstClass.X[self.firstClass.point])
 
-                        self.updateStatus("Scanning 2")
-                        self.secondClass.StartScan()
-                        if (self.secondClassifierList.currentItem().text() == "AAC"):
-                            if (not self.secondClass.isScanning):
-                                QtWidgets.QMessageBox.warning(self, "Tandem Error", "AAC scan error (range?)")
-                                self.endScan()
-                            self.secondClass.next()
+                    self.updateStatus("Scanning 2")
+                    self.secondClass.StartScan()
+                    
+                    # Log exactly when the scan was commanded
+                    self.scanStartTime = time.time()
+                    
+                    if (self.secondClassifierList.currentItem().text() == "AAC"):
+                        if (not self.secondClass.isScanning):
+                            QtWidgets.QMessageBox.warning(self, "Tandem Error", "AAC scan error (range?)")
+                            self.endScan()
+                        self.secondClass.next()
             else:
                 self.updateStatus("Stabilising 1")
-                if (self.isScanner and self.secondClassifierList.currentItem().text() == "3082 DMA"):
-                    self.secondClass.StopScan()
+                
                 self.timer.start(1)
                 return
+                
         if (not self.startRow):
+            # Enforce a 3-second hardware grace period for scanners 
+            if (self.isScanner and hasattr(self, 'scanStartTime') and (time.time() - self.scanStartTime < 3.0)):
+                self.timer.start(1)
+                return
+                
+            is_done = False
+            if self.isScanner and self.secondClassifierList.currentItem().text() == "3082 DMA":
+                is_done = self.secondClass.DataReady()
+            elif self.isScanner and self.secondClassifierList.currentItem().text() == "AAC":
+                is_done = not self.secondClass.isScanning
+            else:
+                is_done = self.secondClass.isReady()
+
             # write the measured data to the file and start the next setpoint
-            if (self.secondClass.isReady()):
+            if (is_done):
                 self.timer.stop()
                 if (not (self.isScanner)):
                     self.updateStatus("Delay 2")
@@ -515,7 +651,7 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                 if (not self.isScanning):
                     return
             else:
-                self.updateStatus("Stabilising 2")
+                self.updateStatus("Stabilising 2" if not self.isScanner else "Scanning 2")
         self.timer.start(1)
 
     def next(self):
@@ -526,6 +662,9 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
             if (self.secondClass.DataReady()):  # 2nd class processing have completed
                 if (self.doBypass):
                     self.doBypass = False
+                    if (self.disBypass and not self.finalBypass):
+                        self.arduino.disableBypass()
+                        self.disBypass = False
                 if (not self.firstClass.moreToCome()):
                     if (self.finalBypass or not self.Bypass.isChecked()):
                         self.endScan()
@@ -534,16 +673,11 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                         self.doBypass = True
                         self.finalBypass = True
                         self.disBypass = True
-                        # self.firstClass.enableBypass(3)  # When using the analog output of the instrument
                         self.arduino.enableBypass()  # When using the Arduino
 
-                        for i in range(int(float(self.firstDelay.toPlainText())*10.0)):
-                            time.sleep(0.1)
-                        self.secondClass.StartScan()
-                        if (self.secondClassifierList.currentItem().text() == "AAC"):
-                            if (not self.secondClass.isScanning):
-                                QtWidgets.QMessageBox.warning(self, "Tandem Error", "AAC scan error (range?)")
-                                self.endScan()
+                        # Overwrite the TSI 3082 hardware bounds
+                        self.secondClass.setLowerRange(self.secondClass.LowerRange)
+                        self.secondClass.setUpperRange(self.secondClass.UpperRange)
 
                 self.secondClass.reset()
                 self.fileData = {}
@@ -561,11 +695,21 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                 self.Scatterplot = True
                 if (self.doBypass):
                     self.doBypass = False
-                if (not self.firstClass.moreToCome()):
-                    if (self.finalBypass or not self.Bypass.isChecked()):
-                        # plot final step
+                    if (self.disBypass and not self.finalBypass):
+                        self.arduino.disableBypass()
+                        self.disBypass = False
+                        # Apply MathText formatting to the legend label
+                        first_label = self.firstClass.label.replace("dm*", "$d_m^*$").replace("da*", "$d_a^*$").replace("m*", "$m^*$")
+                        
+                        # Grab the current setpoint
+                        setpoint = self.firstClass.X[self.firstClass.point]
+                        
+                        # Use :.4g for adaptive formatting (4 significant digits, scientific notation for tiny/huge numbers)
                         self.plot.axes.plot(
-                            self.secondClass.X, self.G, label=f"{self.firstClass.label} = {round(self.firstClass.X[self.firstClass.point - 1], 2)} {self.firstFromUnit.text()}", color=self.color)
+                            self.secondClass.X, self.G, 
+                            label=f"{first_label} = {setpoint:.4g} {self.firstFromUnit.text()}", 
+                            color=self.color
+                        )
                         self.plot.axes.legend(
                             loc='upper left', fontsize='small')
                         # Combine legends from both plots and place it outside the plot area
@@ -582,15 +726,13 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                             fontsize='small', frameon=False)
                         # self.plot.axes.set_title('Second Classifier Data')
                         # Set non-scientific notation for x-axis tick labels
-                        self.plot.axes.xaxis.set_major_formatter(
-                            mpl.ticker.ScalarFormatter())
-                        self.plot.axes.yaxis.set_major_formatter(
-                            mpl.ticker.ScalarFormatter())
-                        self.plot.axes.yaxis.set_minor_formatter(
-                            mpl.ticker.ScalarFormatter())
-                        self.plot2.axes.yaxis.set_major_formatter(
-                            mpl.ticker.ScalarFormatter())
-                        self.MplWidget.canvas.draw()
+                        self.plot.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                        self.plot.axes.yaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                        self.plot.axes.xaxis.set_minor_formatter(mpl.ticker.ScalarFormatter())
+                        self.plot.axes.yaxis.set_minor_formatter(mpl.ticker.ScalarFormatter())
+                        self.plot2.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                        self.plot2.axes.yaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                        self.MplWidget.canvas.draw_idle()
                         self.endScan()
                         return
                     else:  # Final bypass starts
@@ -599,6 +741,11 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                         self.disBypass = True
                         # self.firstClass.enableBypass(3)  # When using the Arduino
                         self.arduino.enableBypass()  # When using the Arduino
+
+                        # Physically overwrite the TSI 3082 hardware bounds
+                        self.secondClass.setLowerRange(self.secondClass.LowerRange)
+                        self.secondClass.setUpperRange(self.secondClass.UpperRange)
+
                         for i in range(int(float(self.firstDelay.toPlainText())*10.0)):
                             time.sleep(0.1)
                         self.secondClass.run()
@@ -619,10 +766,11 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
 
     def plotIt(self):  # do plot, and add data log row
         if (self.isScanner and self.secondClassifierList.currentItem().text() == "AAC"):
-            self.G.resize(self.secondClass.points)
+            self.G = np.zeros(self.secondClass.points)
             self.X, self.Y = np.meshgrid(
                 self.firstClass.X, self.secondClass.X, indexing='ij')
-            self.Z.resize((self.firstClass.points, self.secondClass.points))
+            self.Z = np.zeros((self.firstClass.points, self.secondClass.points))
+            
         ave = int(self.average.toPlainText())
         self.updateStatus("Averaging")
         conc = 0.0
@@ -634,17 +782,14 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
 
         # Stop the 2nd class # set the pinch valve for the bypass # Start the bypass
         if (self.doBypass and self.firstBypass):
-            self.secondClass.StopScan()
-            # self.firstClass.enableBypass(3)  # When using the analog output of the instrument
-            self.arduino.enableBypass()  # When using Arduino
-            for i in range(int(float(self.firstDelay.toPlainText())*10.0)):
-                time.sleep(0.1)
-            self.secondClass.StartScan()
-            if (self.secondClassifierList.currentItem().text() == "AAC"):
-                if (not self.secondClass.isScanning):
-                    QtWidgets.QMessageBox.warning(self, "Tandem Error", "AAC scan error (range?)")
-                    self.endScan()
+            # self.secondClass.StopScan()
+            # # self.firstClass.enableBypass(3)  # When using the analog output of the instrument
+            # self.arduino.enableBypass()  # When using Arduino
+            # for i in range(int(float(self.firstDelay.toPlainText())*10.0)):
+            #     time.sleep(0.1)
+            # self.secondClass.StartScan()
             self.firstBypass = False
+
         if (self.isScanner and self.secondClassifierList.currentItem().text() == "AAC"):
             if (not self.doBypass):
                 self.firstClass.monitor()
@@ -661,22 +806,22 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                 self.secondClass.monitor()
                 app.processEvents()
                 conc += self.cpc.conc()  # CPC averaging handled here
+                # Wait for 1 full second
                 while (time.time()-tzero < 1.0):
                     app.processEvents()
                     if (not self.isScanning):
                         return
-                    tzero = time.time()
+                tzero = time.time()
             self.cpc.endpoll()
             conc /= float(ave)
         # get fed back averages from classifer
         secData = self.secondClass.getFileData()
         for item, data in secData.items():
             self.fileData[item + str(2)] = data
-
         if (not (self.secondClassifierList.currentItem().text() == "3082 DMA" and self.secondScanner.isChecked())):
             if (self.isScanner):
                 conc = self.secondClass.conc
-            self.fileData["Conc "] = conc
+            self.fileData["Conc"] = conc
             self.cpcNumber.display(conc)
             if (self.doBypass):
                 bypassDummy = {self.firstClass.fileFields[i]: "Bypassed" for i in range(
@@ -688,42 +833,38 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                 if (not self.finalBypass):
                     # self.plot2.clear()
                     self.plot2.axes.plot(self.secondClass.X, self.G,
-                                         label='First Bypass', marker='x', linestyle='-')
+                                         color='red', label='First Bypass', marker='o', linestyle='--')
                 else:
                     self.plot2.axes.plot(self.secondClass.X, self.G,
-                                         label='Final Bypass', marker='x', linestyle='-')
+                                         color='blue', label='Final Bypass', marker='s', linestyle='--')
                 self.plot2.axes.legend(loc='upper right',  fontsize='small')
             else:
-                self.fileData = {**self.fileData, **
-                                 self.firstClass.getFileData()}
+                self.fileData = {**self.fileData, **self.firstClass.getFileData()}
+                
+                # Update the 2D Z array
                 self.Z[self.firstClass.point, self.secondClass.point] = conc
-                # plot a contour
-                self.graph.axes.pcolor(
-                    self.X, self.Y, self.Z, shading='auto')
-                # # Set non-scientific notation for x-axis and y-axis tick labels
-                self.graph.axes.xaxis.set_major_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.graph.axes.yaxis.set_major_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.graph.axes.xaxis.set_minor_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.graph.axes.yaxis.set_minor_formatter(
-                    mpl.ticker.ScalarFormatter())
+
+                # Update the flattened array 
+                self.mesh_2d.set_array(self.Z.ravel())
+                self.mesh_2d.norm.autoscale(self.Z)
+
+                # Update the color limits so the map scales with new data
+                self.mesh_2d.set_clim(vmin=self.Z.min(), vmax=max(self.Z.max(), 1e-9))
+                self.graph.axes.set_xlim(left=self.X.min(), right=self.X.max())
+                self.graph.axes.set_ylim(bottom=self.Y.min(), top=self.Y.max())
 
                 if (self.Scatterplot):
                     # plot a scatter
                     self.plot.axes.plot(self.secondClass.X, self.G,
-                                        label=f"{self.firstClass.label} = {round(self.firstClass.X[self.firstClass.point-1], 3)} {self.firstFromUnit.text()}", color=self.color)
+                                        label=f"{self.firstClass.label} = {round(self.firstClass.X[self.firstClass.point], 3)} {self.firstFromUnit.text()}", color=self.color)
                     self.plot.axes.legend(loc='upper left', fontsize='small')
                     # Set non-scientific notation for x-axis tick labels
-                    self.plot.axes.xaxis.set_major_formatter(
-                        mpl.ticker.ScalarFormatter())
-                    self.plot.axes.yaxis.set_major_formatter(
-                        mpl.ticker.ScalarFormatter())
-                    self.plot.axes.xaxis.set_minor_formatter(
-                        mpl.ticker.ScalarFormatter())
-                    self.plot.axes.yaxis.set_minor_formatter(
-                        mpl.ticker.ScalarFormatter())
+                    self.plot.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                    self.plot.axes.yaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                    self.plot.axes.xaxis.set_minor_formatter(mpl.ticker.ScalarFormatter())
+                    self.plot.axes.yaxis.set_minor_formatter(mpl.ticker.ScalarFormatter())
+                    self.plot2.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                    self.plot2.axes.yaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
                     # Combine legends from both plots and place it outside the plot area
                     legend_lines, legend_labels = self.plot.axes.get_legend_handles_labels()
                     legend_lines2, legend_labels2 = self.plot2.axes.get_legend_handles_labels()
@@ -737,190 +878,145 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
                         loc='upper left', bbox_to_anchor=(1.04, 1),
                         fontsize='small', frameon=False)
                     # self.plot.axes.set_title('Second Classifier Data')
-                    self.MplWidget.canvas.draw()
+                    self.MplWidget.canvas.draw_idle()
 
-                    # Set non-scientific notation for x-axis tick labels
-                    self.plot_live.axes.xaxis.set_major_formatter(
-                        ScalarFormatter())
+                    # Set non-scientific notation for x-axis major tick labels and hide minor
+                    self.plot_live.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+                    self.plot_live.axes.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
                     # Adjust the layout to accommodate the legend outside the box
                     self.MplWidget.canvas.figure.tight_layout(
                         rect=[0, 0, 1, 1])   # Adjust the right margin
                     self.Scatterplot = False
                     self.G = np.zeros(self.secondClass.points)
 
-                # mapping the CPC data to the list G, and then plot the  scatter
                 self.G[self.secondClass.point] = conc
-                # Clear the existing live-plot
-                self.plot_live.clear()
-                # plot a live scatter
-                self.plot_live.set_xscale('log')
-                self.plot_live.set_xlabel(
-                    f"{self.secondClass.label}[{self.secondFromUnit.text()}]")
-                self.plot_live.set_ylabel("N [Counts]")
-                self.plot_live.axes.plot(self.secondClass.X, self.G,
-                                         label=f"{self.firstClass.label} = {round(self.firstClass.x, 2)} {self.firstFromUnit.text()}")
+                
+                # Update the underlying data of the line object
+                self.live_line.set_data(self.secondClass.X, self.G)
+                
+                # Update the label dynamically
+                self.live_line.set_label(f"{self.firstClass.label} = {round(self.firstClass.x, 2)} {self.firstFromUnit.text()}")
                 self.plot_live.axes.legend(loc='upper left', fontsize='small')
-                # Set non-scientific notation for x-axis tick labels
-                self.plot_live.axes.xaxis.set_major_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.plot_live.axes.xaxis.set_minor_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.plot_live.axes.yaxis.set_major_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.plot_live.axes.yaxis.set_minor_formatter(
-                    mpl.ticker.ScalarFormatter())
-                # Draw the plot
+                
+                # Rescale the axes to fit the new data
+                self.plot_live.axes.relim()
+                self.plot_live.axes.autoscale_view()
+
+                # Trigger GUI updates without blocking
                 self.plotWidget.canvas.draw_idle()
-                # Adjust the layout to prevent cutoff of axis labels
-                self.plotWidget.canvas.figure.tight_layout()
+                self.MplWidget_live.canvas.draw_idle()
+                
+            self.writer.writerow(self.fileData)  # commit log row to fil
 
-            # Adjust the layout to accommodate the legend outside the box
-            self.plotWidget.canvas.figure.tight_layout(
-                rect=[0, 0, 1, 1])  # Adjust the right margin
-            # self.plot_live.axes.set_title('Second Classifier Live Data')
-            self.MplWidget_live.canvas.draw()
-            # Adjust the layout to prevent cutoff of axis labels
-            self.MplWidget_live.canvas.figure.tight_layout()
-
-            self.writer.writerow(self.fileData)  # commit log row to file
+            # Force the buffer to write to the file immediately
+            self.file.flush()
+            os.fsync(self.file.fileno())
 
         # If the 2nd class is DMA-3082 and the scanning is done, commit log row to file
         elif (self.secondClassifierList.currentItem().text() == "3082 DMA" and self.secondScanner.isChecked()):
             # Get rid of Scientific notation
-            self.plot.axes.xaxis.set_major_formatter(
-                mpl.ticker.ScalarFormatter())
-            self.plot.axes.yaxis.set_major_formatter(
-                mpl.ticker.ScalarFormatter())
-            self.plot.axes.yaxis.set_minor_formatter(
-                mpl.ticker.ScalarFormatter())
-            self.plot2.axes.yaxis.set_major_formatter(
-                mpl.ticker.ScalarFormatter())
+            self.plot.axes.xaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+            self.plot.axes.yaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+            self.plot.axes.yaxis.set_minor_formatter(mpl.ticker.ScalarFormatter())
+            self.plot2.axes.yaxis.set_major_formatter(mpl.ticker.ScalarFormatter())
+            
             if (self.secondClass.DataReady()):
-                LowerSizeRange = self.secondClass.LowerSizeRange()
-                UpperSizeRange = self.secondClass.UpperSizeRange()
+                LowerSizeRange = int(self.secondClass.LowerSizeRange())
+                UpperSizeRange = int(self.secondClass.UpperSizeRange())
+                
+                # Fetch raw data
                 Conc_3082 = self.secondClass.output3082()
+                
+                # Explicitly convert all string concentrations to floats 
+                # and handle any missing or bad data gracefully
                 conc3082 = {}
-                # set the concentration of 3082,
-                conc3082 = {i: Conc_3082[i] for i in range(193)}
-                for i in range(int(LowerSizeRange), int(UpperSizeRange)):
-                    self.fileData["Dm (nm)2"] = self.secondLowerRange.itemText(
-                        i)   # read the textvalue of particle diameter
-                    self.fileData["Conc "] = conc3082[i+1]
-                    if (self.doBypass):
-                        bypassDummy = {self.firstClass.fileFields[i]: "Bypassed" for i in range(
-                            len(self.firstClass.fileFields))}
-                        self.fileData = {**self.fileData, **bypassDummy}
-                        if (self.disBypass):  # return the pinch valve to  normal scanning
-                            # self.firstClass.disableBypass(3)  # When using the analog output of the instrument
+                for i in range(193):
+                    try:
+                        conc3082[i] = float(Conc_3082[i])
+                    except (ValueError, KeyError, TypeError):
+                        conc3082[i] = 0.0
 
-                            self.arduino.disableBypass()  # When using Arduino
-                            for i in range(int(float(self.firstDelay.toPlainText())*10.0)):
+                # Commit log rows to file
+                for i in range(LowerSizeRange, UpperSizeRange):
+                    self.fileData["dm* (nm)2"] = self.secondLowerRange.itemText(i)
+                    self.fileData["Conc"] = conc3082[i+1]
+                    if (self.doBypass):
+                        bypassDummy = {self.firstClass.fileFields[k]: "Bypassed" for k in range(len(self.firstClass.fileFields))}
+                        self.fileData = {**self.fileData, **bypassDummy}
+                        if (self.disBypass):
+                            self.arduino.disableBypass()
+                            for _ in range(int(float(self.firstDelay.toPlainText())*10.0)):
                                 time.sleep(0.1)
                             self.disBypass = False
                     else:
-                        self.fileData = {**self.fileData, **
-                                         self.firstClass.getFileData()}
-                    # commit log row to file
+                        self.fileData = {**self.fileData, **self.firstClass.getFileData()}
+                    
                     self.writer.writerow(self.fileData)
+                    self.file.flush()
+                    os.fsync(self.file.fileno())
 
-                if self.makesecondClassX:  # making 3082 DMA points as an array
-                    self.secondClassX = np.array([float(self.secondLowerRange.itemText(
-                        i)) for i in range(int(LowerSizeRange), int(UpperSizeRange))])
-                    self.Z = np.zeros(
-                        (self.firstClass.points, self.secondClassX.shape[0]))
-                    self.z = np.zeros(self.secondClassX.shape[0])
-                    # self.makesecondClassX = False
-                # self.z = np.zeros(self.secondClassX.shape[0])
-                self.X, self.Y = np.meshgrid(
-                    self.firstClass.X, self.secondClassX, indexing='ij')
 
-                # mapping the CPC data to the matrix Z and list z, and then plot the contour and scatter, respectively
-                j = 0
+                # Sliced active range for 1D plotting (now strictly floats)
+                active_x = np.array(self.secondClassX[LowerSizeRange:UpperSizeRange], dtype=float)
+                active_z = np.array([conc3082[i+1] for i in range(LowerSizeRange, UpperSizeRange)], dtype=float)
 
-                for i in range(int(LowerSizeRange), int(UpperSizeRange)):
-                    self.Z[self.firstClass.point, j] = conc3082[i+1]
-                    self.z[j] = conc3082[i+1]
-                    j += 1
                 if (not self.doBypass):
-                    # plot a contour
-                    self.graph.axes.pcolor(
-                        self.X, self.Y, self.Z, shading='auto')
+                    # Map numerical concentrations directly to absolute channel index i
+                    for i in range(LowerSizeRange, UpperSizeRange):
+                        self.Z[self.firstClass.point, i] = conc3082[i+1]
 
-                    # plot a scatter
-                    self.plot.axes.plot(self.secondClassX, self.z,
-                                        label=f"{self.firstClass.label} = {round(self.firstClass.x, 3)} {self.firstFromUnit.text()}", color=self.color)
+                    # Update 2D Mesh safely
+                    self.mesh_2d.set_array(self.Z.ravel())
+                    
+                    # Dynamically adjust color limits based on the new maximum concentration
+                    current_max = np.max(self.Z)
+                    if current_max <= 0:
+                        current_max = 1e-9  # Prevent math errors if empty
+                    self.mesh_2d.set_clim(vmin=0, vmax=current_max)
+
+                    # Tighten the 2D plot's Y-axis strictly to the measured domain
+                    if self.firstClass.point == 0:
+                        self.graph.axes.set_ylim(bottom=active_x.min(), top=active_x.max())
+                    elif self.varBins:
+                        cur_bottom, cur_top = self.graph.axes.get_ylim()
+                        self.graph.axes.set_ylim(bottom=min(cur_bottom, active_x.min()), top=max(cur_top, active_x.max()))
+
+                    # Update cumulative 1D plot
+                    self.plot.axes.plot(active_x, active_z,
+                                        label=f"{self.firstClass.label} = {round(self.firstClass.X[self.firstClass.point], 3)} {self.firstFromUnit.text()}", 
+                                        color=self.color)
                     self.plot.axes.legend(loc='upper left', fontsize='small')
 
-                    # Clear the existing live-plot
-                    self.plot_live.clear()
-                    self.plot_live.set_xscale('log')
-                    # plot a live scatter
-                    self.plot_live.set_xlabel(
-                        f"{self.secondClass.label}[{self.secondFromUnit.text()}]")
-                    self.plot_live.set_ylabel("N [Counts]")
-                    self.plot_live.axes.plot(self.secondClassX, self.z,
-                                             label=f"{self.firstClass.label} = {round(self.firstClass.x, 3)} {self.firstFromUnit.text()}")
-                    self.plot_live.axes.legend(
-                        loc='upper left', fontsize='small')
-                    # Draw the plot
-                    self.plotWidget.canvas.draw_idle()
-                    # Adjust the layout to prevent cutoff of axis labels
-                    self.plotWidget.canvas.figure.tight_layout()
+                    # Update Live 1D Line Plot
+                    self.live_line.set_data(active_x, active_z)
+                    self.live_line.set_label(f"{self.firstClass.label} = {round(self.firstClass.X[self.firstClass.point], 3)} {self.firstFromUnit.text()}")
+                    self.plot_live.axes.legend(loc='upper left', fontsize='small')
+                    self.plot_live.axes.relim()
+                    self.plot_live.axes.autoscale_view()
 
-                else:  # plot ByPass results
+                    # Trigger canvas redrawing for ALL graphs (CRITICAL FIX)
+                    self.graph.figure.canvas.draw_idle()       # <--- Added .figure to access the canvas
+                    self.plotWidget.canvas.draw_idle()         # <--- Updates cumulative 1D
+                    self.MplWidget_live.canvas.draw_idle()     # <--- Updates live 1D
+
+                else:  # Plot ByPass results
                     if (not self.finalBypass):
-                        # self.plot2.clear()
-                        self.Z = np.zeros(
-                            (self.firstClass.points, self.secondClassX.shape[0]))
-                        self.plot2.axes.plot(self.secondClassX, self.z,
-                                             label='First Bypass', marker='x', linestyle='-')
+                        self.plot2.axes.plot(active_x, active_z, color='red', label='First Bypass', marker='o', linestyle='--')
                     else:
-                        self.plot2.axes.plot(self.secondClassX, self.z,
-                                             label='Final Bypass', marker='x', linestyle='-')
-                    self.plot2.axes.legend(
-                        loc='upper right',  fontsize='small')
+                        self.plot2.axes.plot(active_x, active_z, color='blue', label='Final Bypass', marker='s', linestyle='--')
+                    self.plot2.axes.legend(loc='upper right', fontsize='small')
 
-                # Set non-scientific notation for x-axis tick labels
-                self.plot.axes.xaxis.set_major_formatter(ScalarFormatter())
-                self.plot_live.axes.xaxis.set_major_formatter(
-                    ScalarFormatter())
-
-                # Get rid of Scientific notation
-
-                # Combine legends from both plots and place it outside the plot area
+                # Maintain layout and clean legend formatting
                 legend_lines, legend_labels = self.plot.axes.get_legend_handles_labels()
                 legend_lines2, legend_labels2 = self.plot2.axes.get_legend_handles_labels()
-
-                combined_legend_lines = legend_lines + legend_lines2
-                combined_legend_labels = legend_labels + legend_labels2
-                # remove the bypass legend
                 if self.plot.get_legend():
                     self.plot.get_legend().remove()
-                self.plot2.axes.legend(
-                    combined_legend_lines, combined_legend_labels,
-                    loc='upper left', bbox_to_anchor=(1.1, 1),
-                    fontsize='small', frameon=False)
+                self.plot2.axes.legend(legend_lines + legend_lines2, legend_labels + legend_labels2,
+                                        loc='upper left', bbox_to_anchor=(1.1, 1), fontsize='small', frameon=False)
 
-                # Get rid of Scientific notation
-                self.plot.axes.xaxis.set_major_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.plot.axes.yaxis.set_major_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.plot.axes.yaxis.set_minor_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.plot2.axes.yaxis.set_major_formatter(
-                    mpl.ticker.ScalarFormatter())
-                self.MplWidget.canvas.draw()
-
-                # Adjust the layout to accommodate the legend outside the box
-                self.plotWidget.canvas.figure.tight_layout()  # Adjust the right margin
-                self.MplWidget.canvas.figure.tight_layout()   # Adjust the right margin
-
-                # self.plot.axes.set_title('Second Classifier Data')
-                # self.plot_live.axes.set_title('Second Classifier Live Data')
-
-                self.MplWidget_live.canvas.draw()
-                # Adjust the layout to prevent cutoff of axis labels
+                self.MplWidget.canvas.draw_idle()
+                self.plotWidget.canvas.figure.tight_layout()
+                self.MplWidget.canvas.figure.tight_layout()
                 self.MplWidget_live.canvas.figure.tight_layout()
 
         self.updateStatus()
@@ -961,6 +1057,21 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
             pass
         self.isScanning = False
         self.timer.stop()
+        # Reset to prevent Ghost data
+        try:
+            # Close the physical bypass valve if it was left open
+            if hasattr(self, 'arduino'):
+                self.arduino.disableBypass()
+        except Exception:
+            pass
+            
+        try:
+            # Force the 3082 DMA to stop scanning so its hardware buffer clears
+            if hasattr(self, 'secondClass') and self.isScanner:
+                if self.secondClassifierList.currentItem().text() == "3082 DMA":
+                    self.secondClass.StopScan()
+        except Exception:
+            pass
         app.processEvents()
         time.sleep(1)
         del self.firstClass
@@ -1271,7 +1382,7 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
     def getFileFields(self):
         secFields = []
         secFields = [field + str(2)
-                     for field in self.secondClass.fileFields]+["Conc "]
+                     for field in self.secondClass.fileFields]+["Conc"]
         # note we _prepend_ the firstClass headers. This will set the order in the file.
         return self.firstClass.fileFields+secFields
 
@@ -1302,9 +1413,33 @@ class Ui(QtWidgets.QMainWindow):  # main GUI object
 
         self.cpc.disconnect()
 
+
+    def load_and_fit_data(self):
+        """Opens file dialog and sends data to the fitting tool."""
+        self.fit_button.setEnabled(False)
+        self.fit_button.clearFocus()
+        
+        try:
+            file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, 
+                "Select Tandem Data File", 
+                "", 
+                "Text Files (*.txt);;CSV Files (*.csv);;All Files (*)"
+            )
+            
+            if file_path:
+                # Pass the file path, the MplWidget, and the main window to the GUI function
+                aerosol_psd_fitting_tool.process_tandem_data_gui(file_path, self.MplWidget_live, self)
+
+                # Force the figure margins to expand and accommodate the new title
+                self.MplWidget_live.canvas.figure.tight_layout()
+                self.MplWidget_live.canvas.draw_idle()
+        finally:
+            # Re-enable the button once the entire fitting process is complete
+            self.fit_button.setEnabled(True)
+    
     def invert(self):
         self.barf("Inversion feature not implemented yet.")
-        
 
 app.setApplicationName("Tandem")
 app.setOrganizationName("Cambustion and The University of Alberta")
